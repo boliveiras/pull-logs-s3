@@ -1,0 +1,15 @@
+# Segredos e estado local
+.env
+ultima_sincronizacao.txt
+
+# Logs e dados baixados
+*.log
+*.gz
+Logs/
+LogFiles/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
