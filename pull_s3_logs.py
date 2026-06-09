@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Sincroniza logs da Cloudflare (Logpush -> S3) para um diretório local.
+"""Faz o pull de logs de um bucket S3 para um diretório local.
 
-Os arquivos .gz são baixados do bucket S3, descompactados para .log e deixados
-em uma pasta que o NXLog observa (tail) para encaminhar ao SIEM.
+Para cada objeto do bucket:
+  - se estiver compactado (.gz), baixa e descompacta para .log;
+  - se já estiver em texto (.log), apenas baixa.
 
-Fluxo:  S3  ->  este script (pull)  ->  armazenamento local  ->  NXLog  ->  SIEM
+Os arquivos ficam numa pasta de staging que um agente (ex.: NXLog) observa
+(tail) para encaminhar ao SIEM.
+
+Fluxo:  S3  ->  este script (pull)  ->  armazenamento local  ->  agente  ->  SIEM
 
 A configuração vem de variáveis de ambiente (veja .env.example). Nada de
 credencial ou caminho fica embutido no código.
@@ -28,7 +32,7 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-logger = logging.getLogger("cloudflare_sync")
+logger = logging.getLogger("pull_s3_logs")
 
 # Sinalizador de parada para encerrar o loop com elegância (Ctrl+C / SIGTERM).
 _stop = False
@@ -39,8 +43,8 @@ class Config:
     """Configuração lida do ambiente."""
 
     bucket_name: str
-    download_dir: Path        # onde os .gz são baixados
-    log_dir: Path             # onde os .log descompactados ficam (lidos pelo NXLog)
+    download_dir: Path        # staging de download dos arquivos compactados
+    log_dir: Path             # onde os .log ficam (pasta observada pelo agente)
     state_file: Path          # guarda o timestamp da última sincronização
     exec_log_file: Path       # log de execução deste script
     prefix_template: str      # prefixo do S3, ex.: "%Y%m%d/" (data UTC)
@@ -49,15 +53,15 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        base = Path(os.environ.get("CF_BASE_DIR", "D:/Cloudflare"))
+        base = Path(os.environ.get("PULL_BASE_DIR", "D:/Logs"))
         return cls(
-            bucket_name=os.environ.get("CF_BUCKET", "your-cloudflare-logs-bucket"),
+            bucket_name=os.environ.get("S3_BUCKET", "your-s3-logs-bucket"),
             download_dir=base,
-            log_dir=Path(os.environ.get("CF_LOG_DIR", base / "Logs")),
-            state_file=Path(os.environ.get("CF_STATE_FILE", base / "ultima_sincronizacao.txt")),
-            exec_log_file=Path(os.environ.get("CF_EXEC_LOG", "C:/LogFiles/Cloudflare/sync_execution.log")),
-            prefix_template=os.environ.get("CF_PREFIX_TEMPLATE", "%Y%m%d/"),
-            interval_seconds=int(os.environ.get("CF_INTERVAL_SECONDS", "60")),
+            log_dir=Path(os.environ.get("PULL_LOG_DIR", base / "Logs")),
+            state_file=Path(os.environ.get("PULL_STATE_FILE", base / "ultima_sincronizacao.txt")),
+            exec_log_file=Path(os.environ.get("PULL_EXEC_LOG", "C:/LogFiles/pull-logs-s3/sync_execution.log")),
+            prefix_template=os.environ.get("S3_PREFIX_TEMPLATE", "%Y%m%d/"),
+            interval_seconds=int(os.environ.get("PULL_INTERVAL_SECONDS", "60")),
             aws_region=os.environ.get("AWS_REGION") or None,
         )
 
@@ -112,6 +116,26 @@ def save_watermark(state_file: Path, value: datetime) -> None:
     state_file.write_text(value.isoformat(), encoding="utf-8")
 
 
+def is_compressed(key: str) -> bool:
+    """Indica se o objeto do S3 está compactado em gzip (.gz)."""
+    return key.lower().endswith(".gz")
+
+
+def staging_log_name(filename: str) -> str:
+    """Nome do arquivo final na pasta de staging (sempre termina em .log).
+
+    Remove o sufixo .gz e garante a extensão .log para o agente conseguir
+    captar via glob '*.log'. Ex.: 'evt.log.gz' -> 'evt.log';
+    'evt.json.gz' -> 'evt.json.log'; 'evt.gz' -> 'evt.log'.
+    """
+    name = filename
+    if name.lower().endswith(".gz"):
+        name = name[:-3]
+    if not name.lower().endswith(".log"):
+        name += ".log"
+    return name
+
+
 def decompress(gz_path: Path, dest_path: Path) -> None:
     """Descompacta um .gz para .log usando streaming (baixo uso de memória)."""
     with gzip.open(gz_path, "rb") as f_in, open(dest_path, "wb") as f_out:
@@ -146,16 +170,23 @@ def sync_once(s3, cfg: Config) -> None:
         for obj in iter_new_objects(s3, cfg, watermark):
             key = obj["Key"]
             filename = os.path.basename(key)
-            gz_path = cfg.download_dir / filename
-            log_path = cfg.log_dir / filename.replace(".gz", ".log")
+            compressed = is_compressed(key)
+            dest = cfg.log_dir / (staging_log_name(filename) if compressed else filename)
 
             # Evita rebaixar/reprocessar o que já existe localmente.
-            if log_path.exists():
+            if dest.exists():
                 logger.debug("Já processado, ignorando: %s", filename)
+            elif compressed:
+                # Compactado: baixa o .gz para o staging e descompacta para .log.
+                tmp_gz = cfg.download_dir / filename
+                s3.download_file(cfg.bucket_name, key, str(tmp_gz))
+                logger.info("Baixado (compactado): %s", key)
+                decompress(tmp_gz, dest)
+                downloaded += 1
             else:
-                s3.download_file(cfg.bucket_name, key, str(gz_path))
-                logger.info("Baixado: %s", key)
-                decompress(gz_path, log_path)
+                # Já em texto: baixa direto para a pasta observada pelo agente.
+                s3.download_file(cfg.bucket_name, key, str(dest))
+                logger.info("Baixado (texto): %s", key)
                 downloaded += 1
 
             if newest is None or obj["LastModified"] > newest:
@@ -197,7 +228,7 @@ def run_loop(s3, cfg: Config) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sincroniza logs da Cloudflare do S3 para o disco local.")
+    parser = argparse.ArgumentParser(description="Faz o pull de logs de um bucket S3 para o disco local.")
     parser.add_argument("--once", action="store_true", help="Executa um único ciclo e sai.")
     args = parser.parse_args()
 

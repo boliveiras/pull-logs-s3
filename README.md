@@ -1,43 +1,51 @@
-# Cloudflare Logs: do S3 para o SIEM
+# pull-logs-s3
 
-Pequeno pipeline para trazer os logs da Cloudflare (entregues via **Logpush**
-num bucket S3) até o SIEM, passando por um servidor Windows que faz o
-encaminhamento com o **NXLog**.
+Pequeno utilitário para fazer o **pull de logs de um bucket S3** para um
+diretório local, de onde um agente (NXLog, Filebeat, etc.) encaminha para o
+SIEM.
+
+A lógica é **agnóstica de tecnologia**: serve para qualquer fonte que entregue
+logs num bucket S3 (CDNs, WAFs, serviços de nuvem...). Basta apontar o bucket,
+os caminhos e o agente de saída. O exemplo de agente incluído usa **NXLog**.
 
 ## A ideia
 
-A Cloudflare não envia os logs direto pro nosso SIEM. Ela deposita arquivos
-`.gz` num bucket S3. Então o caminho é:
+Muitas plataformas não mandam log direto pro SIEM — elas depositam os arquivos
+num bucket S3 (geralmente compactados em `.gz`). Esse utilitário fecha esse vão:
 
-```
-  Cloudflare Logpush
-         │
-         ▼
-   ┌───────────┐     ┌──────────────────────┐     ┌──────────────────┐     ┌────────┐
-   │  Bucket   │ --> │  sync_cloudflare_    │ --> │  Disco local      │ --> │ NXLog  │ --> SIEM
-   │   S3      │     │  logs.py (pull)      │     │  D:\Cloudflare    │     │ (tail) │
-   └───────────┘     └──────────────────────┘     └──────────────────┘     └────────┘
+```mermaid
+flowchart LR
+    SRC["Fonte<br/>(grava logs no S3)"] --> S3[("Bucket S3")]
+    S3 --> PULL["pull_s3_logs.py<br/>pull periódico"]
+    PULL --> STG["Disco local<br/>(staging .log)"]
+    STG --> AGENT["Agente<br/>(ex.: NXLog, tail)"]
+    AGENT --> SIEM[("SIEM")]
 ```
 
-1. **S3** — a Cloudflare grava os logs compactados (`.gz`), organizados por data.
-2. **Script Python** — baixa os arquivos novos, descompacta para `.log` e
-   guarda numa pasta local. Roda em loop (ou uma vez só).
-3. **Disco local** — área de "staging". O NXLog observa essa pasta.
-4. **NXLog** — faz o *tail* dos `.log` e manda pro SIEM via UDP. Esse mesmo
-   NXLog ainda coleta os Event Logs do Windows (essa parte já vinha junto).
+1. **S3** — a fonte grava os logs, normalmente organizados por data.
+2. **Script Python** — baixa os arquivos novos. Se o objeto vier **compactado
+   (`.gz`)**, descompacta para `.log`; se já vier em **texto (`.log`)**, baixa
+   direto. Roda em loop (ou uma vez só).
+3. **Disco local** — área de "staging". O agente observa essa pasta.
+4. **Agente (ex.: NXLog)** — faz o *tail* dos `.log` e manda pro SIEM.
 5. **SIEM** — recebe tudo e indexa.
 
-A limpeza dos arquivos já processados fica por conta do próprio NXLog (tem um
-agendamento que apaga `.gz` e `.log` antigos), então o disco não enche.
+A limpeza dos arquivos já processados pode ficar por conta do agente. No exemplo
+de NXLog incluído aqui, há um agendamento que apaga `.gz` e `.log` antigos, então
+o disco não enche.
 
 ## Arquivos
 
 | Arquivo | Para que serve |
 |---|---|
-| `sync_cloudflare_logs.py` | Baixa e descompacta os logs do S3. |
-| `nxlog.conf` | Config do NXLog (Community Edition) que lê os logs e envia ao SIEM. |
+| `pull_s3_logs.py` | Faz o pull do S3: baixa e (se preciso) descompacta os logs. |
+| `nxlog.conf` | **Exemplo** de agente (NXLog Community Edition) lendo os logs e enviando ao SIEM. |
 | `.env.example` | Modelo das variáveis de ambiente. Copie para `.env` e ajuste. |
 | `requirements.txt` | Dependências Python (só o `boto3`). |
+
+> O `nxlog.conf` é só um exemplo de saída. Se você usa outro agente (Filebeat,
+> Fluent Bit, Winlogbeat...), basta apontá-lo para a mesma pasta de staging — a
+> parte do pull não muda.
 
 ## Pré-requisitos (importante)
 
@@ -79,38 +87,23 @@ copy .env.example .env
 
 # 4. Carregar as variáveis e rodar
 #    (em produção, isso normalmente vai num serviço / Agendador de Tarefas)
-python sync_cloudflare_logs.py          # loop contínuo
-python sync_cloudflare_logs.py --once   # só um ciclo, útil pra testar
+python pull_s3_logs.py          # loop contínuo
+python pull_s3_logs.py --once   # só um ciclo, útil pra testar
 ```
 
 A configuração do script (bucket, caminhos, intervalo) vem toda de variáveis de
 ambiente — nada fica embutido no código.
 
-## NXLog
+## Exemplo de agente: NXLog
 
 O `nxlog.conf` é compatível com a **Community Edition**. Antes de usar, ajuste
 os `define` no topo do arquivo:
 
-- `SIEM_HOST`, `SIEM_PORT_WINEVT`, `SIEM_PORT_CF` — destino do SIEM.
-- `CF_LOGDIR` — a mesma pasta onde o script Python solta os `.log`.
+- `SIEM_HOST`, `SIEM_PORT_WINEVT`, `SIEM_PORT_S3` — destino do SIEM.
+- `STAGING_DIR` — a mesma pasta onde o script Python solta os `.log` (= `PULL_BASE_DIR`).
 
 Coloque o arquivo em `C:\Program Files\nxlog\conf\nxlog.conf` (ou ajuste o
 caminho da sua instalação) e reinicie o serviço do NXLog.
-
-## O que mudou em relação à versão original
-
-A lógica é a mesma; a refatoração deixou o script mais robusto e fácil de manter:
-
-- **Configuração externa** — saiu tudo do código pra variáveis de ambiente.
-- **Logging com rotação** — usa o módulo `logging` com `RotatingFileHandler`,
-  em vez de abrir o arquivo a cada mensagem.
-- **Paginação no S3** — agora lê além de 1000 objetos por listagem.
-- **Descompactação em streaming** — não carrega o arquivo inteiro na memória.
-- **Datas com timezone** — o `LastModified` do S3 é UTC; o controle da última
-  sincronização passou a respeitar isso e evita comparações quebradas.
-- **Não reprocessa** o que já existe localmente.
-- **Parada limpa** — responde a `Ctrl+C` / `SIGTERM` sem cortar no meio.
-- **Modo `--once`** pra testar sem entrar no loop.
 
 ## Observações de segurança
 
