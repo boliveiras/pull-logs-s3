@@ -66,6 +66,23 @@ class Config:
         )
 
 
+def load_env_file(path: Path) -> None:
+    """Carrega um arquivo .env simples (KEY=VALUE) para o ambiente.
+
+    Não sobrescreve variáveis já definidas — as do sistema/serviço têm
+    prioridade. Linhas em branco e comentários (#) são ignorados. Mantém o
+    script sem dependências extras (não precisa de python-dotenv).
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
 def setup_logging(exec_log_file: Path) -> None:
     """Configura logging para console + arquivo com rotação (5 MB x 5)."""
     exec_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -230,8 +247,15 @@ def run_loop(s3, cfg: Config) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Faz o pull de logs de um bucket S3 para o disco local.")
     parser.add_argument("--once", action="store_true", help="Executa um único ciclo e sai.")
+    parser.add_argument(
+        "--env-file",
+        default=os.environ.get("PULL_ENV_FILE", str(Path(__file__).with_name(".env"))),
+        help="Caminho do .env (padrão: .env na mesma pasta do script).",
+    )
     args = parser.parse_args()
 
+    # Carrega o .env (se existir) antes de ler a configuração.
+    load_env_file(Path(args.env_file))
     cfg = Config.from_env()
     setup_logging(cfg.exec_log_file)
 
