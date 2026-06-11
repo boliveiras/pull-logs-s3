@@ -83,6 +83,22 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+def warn_if_world_readable(path: Path) -> None:
+    """Em sistemas POSIX, alerta se o .env estiver acessível por grupo/outros.
+
+    O .env pode guardar segredos (chaves AWS), então deve ter permissão
+    restrita (ex.: chmod 640). No Windows o controle é via ACL (veja o README).
+    """
+    if os.name != "posix" or not path.exists():
+        return
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        logger.warning(
+            "Permissões frouxas em %s (%o). Restrinja com 'chmod 640' — "
+            "o arquivo pode conter segredos.", path, mode,
+        )
+
+
 def setup_logging(exec_log_file: Path) -> None:
     """Configura logging para console + arquivo com rotação (5 MB x 5)."""
     exec_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -255,9 +271,11 @@ def main() -> int:
     args = parser.parse_args()
 
     # Carrega o .env (se existir) antes de ler a configuração.
-    load_env_file(Path(args.env_file))
+    env_path = Path(args.env_file)
+    load_env_file(env_path)
     cfg = Config.from_env()
     setup_logging(cfg.exec_log_file)
+    warn_if_world_readable(env_path)
 
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
